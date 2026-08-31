@@ -700,6 +700,42 @@ class AsyncServiceCallerNode(Node):
 - Put the service client in a separate `MutuallyExclusiveCallbackGroup`
 - Use `MultiThreadedExecutor` to allow the client group to process the response
 
+### The rclpy `Rate` trap (Humble and Jazzy)
+
+`node.create_rate(hz)` silently registers a `Timer` on the node (in a
+dedicated internal callback group). Two traps:
+
+1. **`rate.destroy()` leaks the timer.** It only marks the wrapper destroyed
+   and wakes sleepers — the underlying timer stays registered in the
+   executor's wait set forever
+   ([rclpy #1278](https://github.com/ros2/rclpy/issues/1278), verified in
+   Humble and Jazzy source). A `Rate` created per call inside a callback
+   leaks one timer per invocation; rclpy rebuilds the wait set from all
+   registered entities every spin iteration, so CPU climbs monotonically as
+   the leaked timers accumulate. The API that actually destroys the timer is
+   `node.destroy_rate(rate)` — it calls `destroy_timer(rate._timer)` before
+   destroying the wrapper.
+2. **`rate.sleep()` blocks the calling thread.** Inside a callback on a
+   `SingleThreadedExecutor` the timer that would wake the sleep can never
+   fire — the node hangs. On a `MultiThreadedExecutor` it silently occupies
+   a worker thread for the duration.
+
+```python
+# WRONG — leaks a Timer into the wait set on every callback invocation
+def command_cb(self, msg):
+    rate = self.create_rate(10)
+    rate.sleep()          # also blocks an executor thread
+    rate.destroy()        # does NOT destroy the hidden timer
+
+# CORRECT cleanup when a Rate is truly unavoidable (e.g. a dedicated thread)
+self.destroy_rate(rate)   # destroys the underlying timer too
+```
+
+Fix: don't create `Rate` objects inside callbacks at all — restructure the
+wait as a long-lived timer or a state machine driven by existing timers.
+Reserve `Rate` for dedicated non-executor threads, and pair every
+`create_rate()` with `node.destroy_rate()`.
+
 ## 4. Intra-process communication
 
 When multiple nodes run in the same process, serialization can be avoided.
@@ -1218,6 +1254,7 @@ class ImageProcessor : public rclcpp::Node
 | Timer drifts under load | Wall timer + heavy callbacks | Use a dedicated callback group or reduce callback work |
 | Intra-process not working | Missing `use_intra_process_comms(true)` or nodes not in same process | Enable in NodeOptions for all participating nodes; ensure they run in the same process (composition, same main(), etc.) |
 | Service call deadlocks executor | Synchronous wait on the future inside the callback | Register a response callback (`async_send_request(request, cb)` / `call_async` + `add_done_callback`) and return; move the client to a separate group only for unavoidable synchronous waits |
+| rclpy CPU climbs steadily over hours/days | `create_rate()` in a callback with `rate.destroy()` cleanup — the hidden timer leaks into the wait set (rclpy #1278) | Use `node.destroy_rate(rate)`; better, never create `Rate` in callbacks (§3, "The rclpy `Rate` trap") |
 
 ---
 
