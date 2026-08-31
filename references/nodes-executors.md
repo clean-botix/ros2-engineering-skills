@@ -182,6 +182,21 @@ executor.spin();  // Uses std::thread::hardware_concurrency() threads
 Callbacks can run in parallel. You **must** pair this with callback groups to
 control which callbacks may overlap (see section 3).
 
+**Thread count defaults — pass `num_threads` explicitly in rclpy.** With no
+argument, rclcpp uses `std::thread::hardware_concurrency()` and rclpy uses
+the machine's CPU count (Humble: `multiprocessing.cpu_count()`; Jazzy:
+`len(os.sched_getaffinity(0))` falling back to `os.cpu_count()` — verify
+against the installed rclpy). Every Python node constructed this way spawns
+one executor thread per core; across a robot running many rclpy nodes that
+is hundreds of mostly idle threads, and the GIL serializes CPU-bound
+callbacks anyway, so the extra threads buy nothing but wake-up and
+context-switch overhead. In rclpy, pass a small explicit count —
+`MultiThreadedExecutor(num_threads=2)` covers most nodes (enough to overlap
+one blocking I/O callback with other work); size it to the number of
+callbacks that genuinely block concurrently, never to the core count. When
+no callback blocks at all, prefer `SingleThreadedExecutor` outright —
+several low-rate nodes can share one executor via repeated `add_node()`.
+
 ### StaticSingleThreadedExecutor (deprecated)
 
 > **Deprecated in Jazzy/Kilted, removed in Rolling.** Migrate to
@@ -642,7 +657,8 @@ class MultiGroupNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = MultiGroupNode()
-    executor = MultiThreadedExecutor()
+    # Always pass num_threads — the rclpy default is one thread per CPU core
+    executor = MultiThreadedExecutor(num_threads=2)
     executor.add_node(node)
     try:
         executor.spin()
