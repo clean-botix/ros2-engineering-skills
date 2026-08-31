@@ -182,6 +182,21 @@ executor.spin();  // Uses std::thread::hardware_concurrency() threads
 Callbacks can run in parallel. You **must** pair this with callback groups to
 control which callbacks may overlap (see section 3).
 
+**Thread-count defaults:** Pass `num_threads` explicitly in rclpy. With no
+argument, rclcpp uses `std::thread::hardware_concurrency()` and rclpy uses
+the machine's CPU count (Humble: `multiprocessing.cpu_count()`; Jazzy:
+`len(os.sched_getaffinity(0))` falling back to `os.cpu_count()` — verify
+against the installed rclpy). Every Python node constructed this way spawns
+one executor thread per core; across a robot running many rclpy nodes that
+is hundreds of mostly idle threads, and the GIL serializes CPU-bound
+callbacks anyway, so the extra threads buy nothing but wake-up and
+context-switch overhead. In rclpy, pass a small explicit count —
+`MultiThreadedExecutor(num_threads=2)` covers most nodes (enough to overlap
+one blocking I/O callback with other work); size it to the number of
+callbacks that genuinely block concurrently, never to the core count. When
+no callback blocks at all, prefer `SingleThreadedExecutor` outright —
+several low-rate nodes can share one executor via repeated `add_node()`.
+
 ### StaticSingleThreadedExecutor (deprecated)
 
 > **Deprecated in Jazzy/Kilted, removed in Rolling.** Migrate to
@@ -207,7 +222,9 @@ on incoming data. Preferred for systems with many nodes and intermittent traffic
 
 `EventsExecutor` remains in the experimental namespace across all current distros
 (Jazzy, Kilted, Rolling): `rclcpp::experimental::executors::EventsExecutor`.
-There is no rclpy port of `EventsExecutor` — it is C++ only.
+On Jazzy it is rclcpp-only; Kilted adds an experimental rclpy port. Lyrical
+additionally ships the separate, non-experimental
+`rclcpp::executors::EventsCBGExecutor` (see the distro table in `SKILL.md`).
 
 **Benchmark note:** Per the iRobot 2023 paper, `EventsExecutor` achieves approximately
 90% reduction in wake-up latency compared to polling-based `SingleThreadedExecutor`
@@ -642,7 +659,8 @@ class MultiGroupNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = MultiGroupNode()
-    executor = MultiThreadedExecutor()
+    # Always pass num_threads — the rclpy default is one thread per CPU core
+    executor = MultiThreadedExecutor(num_threads=2)
     executor.add_node(node)
     try:
         executor.spin()
@@ -699,6 +717,41 @@ class AsyncServiceCallerNode(Node):
 - Make the callback `async def` and `await` the future
 - Put the service client in a separate `MutuallyExclusiveCallbackGroup`
 - Use `MultiThreadedExecutor` to allow the client group to process the response
+
+### The rclpy `Rate` trap
+
+`node.create_rate(hz)` silently registers a `Timer` on the node (in a
+dedicated internal callback group). Two traps:
+
+1. **`rate.destroy()` leaks the timer.** It only marks the wrapper destroyed
+   and wakes sleepers — the underlying timer stays registered in the
+   executor's wait set forever (rclpy #1278, verified in Humble and Jazzy
+   source). A `Rate` created per call inside a callback
+   leaks one timer per invocation; rclpy rebuilds the wait set from all
+   registered entities every spin iteration, so CPU climbs monotonically as
+   the leaked timers accumulate. The API that actually destroys the timer is
+   `node.destroy_rate(rate)` — it calls `destroy_timer(rate._timer)` before
+   destroying the wrapper.
+2. **`rate.sleep()` blocks the calling thread.** Inside a callback on a
+   `SingleThreadedExecutor` the timer that would wake the sleep can never
+   fire — the node hangs. On a `MultiThreadedExecutor` it silently occupies
+   a worker thread for the duration.
+
+```python
+# WRONG — leaks a Timer into the wait set on every callback invocation
+def command_cb(self, msg):
+    rate = self.create_rate(10)
+    rate.sleep()          # also blocks an executor thread
+    rate.destroy()        # does NOT destroy the hidden timer
+
+# CORRECT cleanup when a Rate is truly unavoidable (e.g. a dedicated thread)
+self.destroy_rate(rate)   # destroys the underlying timer too
+```
+
+Fix: never create `Rate` objects inside callbacks — restructure the
+wait as a long-lived timer or a state machine driven by existing timers.
+Reserve `Rate` for dedicated non-executor threads, and pair every
+`create_rate()` with `node.destroy_rate()`.
 
 ## 4. Intra-process communication
 
@@ -836,8 +889,8 @@ check the timer first and process it before taking the message.
 
 > **Note:** The `rclcpp::Executor` protected API varies across distros and is not
 > fully stable. The following shows the architectural pattern — adapt method names
-> to your target distro. For production, consider the `EventsExecutor` (Kilted+)
-> as a higher-performance alternative.
+> to your target distro. For production, consider the `EventsExecutor` (Jazzy+,
+> experimental) as a higher-performance alternative.
 
 ```cpp
 #include <rclcpp/rclcpp.hpp>
@@ -1194,6 +1247,15 @@ class ImageProcessor : public rclcpp::Node
 - **Pre-allocate messages** in real-time paths. Do not allocate in callbacks.
 - **Use `EventsExecutor`** when the callback set is fixed and idle CPU usage matters (`StaticSingleThreadedExecutor` is deprecated).
 - **Measure with `ros2 topic delay`** and **tracing** before optimizing.
+- **rclpy wait-set rebuild scales with entity count:** Every spin iteration
+  re-gathers all subscriptions, timers, services, clients, and waitables
+  from every node on the executor and constructs a fresh wait set (verified
+  in Humble and Jazzy `executors.py`). A node with 40–50 entities pays that
+  cost on every loop, and leaked entities (see the `Rate` trap, section 3)
+  make it grow without bound. Keep per-executor entity counts modest —
+  splitting a monolithic Python node into a few smaller ones sharing one
+  process can help — but measure first: executor thread defaults and entity
+  leaks dominate more often than raw entity count.
 - **Python GIL:** For CPU-bound Python nodes, use `ProcessPoolExecutor` for
   parallel computation, or rewrite the hot path in C++ as a component.
 - **MultiThreadedExecutor starvation (EmSoft 2024):** A 2024 research paper
@@ -1218,6 +1280,7 @@ class ImageProcessor : public rclcpp::Node
 | Timer drifts under load | Wall timer + heavy callbacks | Use a dedicated callback group or reduce callback work |
 | Intra-process not working | Missing `use_intra_process_comms(true)` or nodes not in same process | Enable in NodeOptions for all participating nodes; ensure they run in the same process (composition, same main(), etc.) |
 | Service call deadlocks executor | Synchronous wait on the future inside the callback | Register a response callback (`async_send_request(request, cb)` / `call_async` + `add_done_callback`) and return; move the client to a separate group only for unavoidable synchronous waits |
+| rclpy CPU climbs steadily over hours/days | `create_rate()` in a callback with `rate.destroy()` cleanup — the hidden timer leaks into the wait set (rclpy #1278) | Use `node.destroy_rate(rate)`; better, never create `Rate` in callbacks (see section 3, "The rclpy `Rate` trap") |
 
 ---
 
