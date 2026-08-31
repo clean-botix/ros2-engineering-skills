@@ -222,7 +222,9 @@ on incoming data. Preferred for systems with many nodes and intermittent traffic
 
 `EventsExecutor` remains in the experimental namespace across all current distros
 (Jazzy, Kilted, Rolling): `rclcpp::experimental::executors::EventsExecutor`.
-There is no rclpy port of `EventsExecutor` — it is C++ only.
+On Jazzy it is rclcpp-only; Kilted adds an experimental rclpy port. Lyrical
+additionally ships the separate, non-experimental
+`rclcpp::executors::EventsCBGExecutor` (see the distro table in `SKILL.md`).
 
 **Benchmark note:** Per the iRobot 2023 paper, `EventsExecutor` achieves approximately
 90% reduction in wake-up latency compared to polling-based `SingleThreadedExecutor`
@@ -887,8 +889,8 @@ check the timer first and process it before taking the message.
 
 > **Note:** The `rclcpp::Executor` protected API varies across distros and is not
 > fully stable. The following shows the architectural pattern — adapt method names
-> to your target distro. For production, consider the `EventsExecutor` (Kilted+)
-> as a higher-performance alternative.
+> to your target distro. For production, consider the `EventsExecutor` (Jazzy+,
+> experimental) as a higher-performance alternative.
 
 ```cpp
 #include <rclcpp/rclcpp.hpp>
