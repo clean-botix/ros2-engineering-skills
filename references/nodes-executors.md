@@ -1246,6 +1246,15 @@ class ImageProcessor : public rclcpp::Node
 - **Pre-allocate messages** in real-time paths. Do not allocate in callbacks.
 - **Use `EventsExecutor`** when the callback set is fixed and idle CPU usage matters (`StaticSingleThreadedExecutor` is deprecated).
 - **Measure with `ros2 topic delay`** and **tracing** before optimizing.
+- **rclpy wait-set rebuild scales with entity count:** every spin iteration
+  re-gathers all subscriptions, timers, services, clients, and waitables
+  from every node on the executor and constructs a fresh wait set (verified
+  in Humble and Jazzy `executors.py`). A node with 40–50 entities pays that
+  cost on every loop, and leaked entities (see the `Rate` trap, section 3)
+  make it grow without bound. Keep per-executor entity counts modest —
+  splitting a monolithic Python node into a few smaller ones sharing one
+  process can help — but measure first: executor thread defaults and entity
+  leaks dominate more often than raw entity count.
 - **Python GIL:** For CPU-bound Python nodes, use `ProcessPoolExecutor` for
   parallel computation, or rewrite the hot path in C++ as a component.
 - **MultiThreadedExecutor starvation (EmSoft 2024):** A 2024 research paper
