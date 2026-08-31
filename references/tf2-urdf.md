@@ -246,6 +246,20 @@ class TargetTracker(Node):
             self.get_logger().warn(f'Could not get transform: {ex}')
 ```
 
+> **CPU cost warning (rclpy):** The Python `TransformListener` subscribes to
+> `/tf` (depth 100) and `/tf_static` and deserializes **every** transform
+> message in Python, whether or not the node ever performs a lookup. On a
+> robot with several broadcasters at 50–100 Hz this costs roughly 10× the
+> CPU of the rclcpp listener for the same tree (reported ~8% vs ~1% of a
+> core — see ROS Answers #381395). `spin_thread=True` only moves the work to
+> a dedicated thread; it does not reduce it, and every additional rclpy node
+> carrying its own listener pays the full stream again. Mitigations, in
+> order of preference: keep high-rate TF consumption in C++ nodes; use a
+> C++-backed buffer binding such as `bitbots_tf_buffer` in rclpy nodes;
+> share one listener per process instead of one per node; cache lookup
+> results instead of calling `lookup_transform` every timer tick when the
+> queried transform changes slowly.
+
 ### Time-travel queries
 
 ```cpp
