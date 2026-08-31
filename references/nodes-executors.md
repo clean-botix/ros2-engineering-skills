@@ -182,7 +182,7 @@ executor.spin();  // Uses std::thread::hardware_concurrency() threads
 Callbacks can run in parallel. You **must** pair this with callback groups to
 control which callbacks may overlap (see section 3).
 
-**Thread count defaults — pass `num_threads` explicitly in rclpy.** With no
+**Thread-count defaults:** Pass `num_threads` explicitly in rclpy. With no
 argument, rclcpp uses `std::thread::hardware_concurrency()` and rclpy uses
 the machine's CPU count (Humble: `multiprocessing.cpu_count()`; Jazzy:
 `len(os.sched_getaffinity(0))` falling back to `os.cpu_count()` — verify
@@ -716,16 +716,15 @@ class AsyncServiceCallerNode(Node):
 - Put the service client in a separate `MutuallyExclusiveCallbackGroup`
 - Use `MultiThreadedExecutor` to allow the client group to process the response
 
-### The rclpy `Rate` trap (Humble and Jazzy)
+### The rclpy `Rate` trap
 
 `node.create_rate(hz)` silently registers a `Timer` on the node (in a
 dedicated internal callback group). Two traps:
 
 1. **`rate.destroy()` leaks the timer.** It only marks the wrapper destroyed
    and wakes sleepers — the underlying timer stays registered in the
-   executor's wait set forever
-   ([rclpy #1278](https://github.com/ros2/rclpy/issues/1278), verified in
-   Humble and Jazzy source). A `Rate` created per call inside a callback
+   executor's wait set forever (rclpy #1278, verified in Humble and Jazzy
+   source). A `Rate` created per call inside a callback
    leaks one timer per invocation; rclpy rebuilds the wait set from all
    registered entities every spin iteration, so CPU climbs monotonically as
    the leaked timers accumulate. The API that actually destroys the timer is
@@ -747,7 +746,7 @@ def command_cb(self, msg):
 self.destroy_rate(rate)   # destroys the underlying timer too
 ```
 
-Fix: don't create `Rate` objects inside callbacks at all — restructure the
+Fix: never create `Rate` objects inside callbacks — restructure the
 wait as a long-lived timer or a state machine driven by existing timers.
 Reserve `Rate` for dedicated non-executor threads, and pair every
 `create_rate()` with `node.destroy_rate()`.
@@ -1246,7 +1245,7 @@ class ImageProcessor : public rclcpp::Node
 - **Pre-allocate messages** in real-time paths. Do not allocate in callbacks.
 - **Use `EventsExecutor`** when the callback set is fixed and idle CPU usage matters (`StaticSingleThreadedExecutor` is deprecated).
 - **Measure with `ros2 topic delay`** and **tracing** before optimizing.
-- **rclpy wait-set rebuild scales with entity count:** every spin iteration
+- **rclpy wait-set rebuild scales with entity count:** Every spin iteration
   re-gathers all subscriptions, timers, services, clients, and waitables
   from every node on the executor and constructs a fresh wait set (verified
   in Humble and Jazzy `executors.py`). A node with 40–50 entities pays that
@@ -1279,7 +1278,7 @@ class ImageProcessor : public rclcpp::Node
 | Timer drifts under load | Wall timer + heavy callbacks | Use a dedicated callback group or reduce callback work |
 | Intra-process not working | Missing `use_intra_process_comms(true)` or nodes not in same process | Enable in NodeOptions for all participating nodes; ensure they run in the same process (composition, same main(), etc.) |
 | Service call deadlocks executor | Synchronous wait on the future inside the callback | Register a response callback (`async_send_request(request, cb)` / `call_async` + `add_done_callback`) and return; move the client to a separate group only for unavoidable synchronous waits |
-| rclpy CPU climbs steadily over hours/days | `create_rate()` in a callback with `rate.destroy()` cleanup — the hidden timer leaks into the wait set (rclpy #1278) | Use `node.destroy_rate(rate)`; better, never create `Rate` in callbacks (§3, "The rclpy `Rate` trap") |
+| rclpy CPU climbs steadily over hours/days | `create_rate()` in a callback with `rate.destroy()` cleanup — the hidden timer leaks into the wait set (rclpy #1278) | Use `node.destroy_rate(rate)`; better, never create `Rate` in callbacks (see section 3, "The rclpy `Rate` trap") |
 
 ---
 
